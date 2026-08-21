@@ -1,0 +1,285 @@
+// auth/auth-proxy.js
+// HTTP auth proxy for ssh-mcp. Checks an API key, resolves SSH aliases, forwards to core.
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+
+// Normalize env secrets: trim whitespace (newlines sneak in via Portainer/compose)
+// and strip literal wrapping quotes if a YAML value was pasted.
+function normalizeSecret(v) {
+  let s = String(v || "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
+  return s;
+}
+
+const API_KEY = normalizeSecret(process.env.SSHMCP_API_KEY);
+const TARGET_HOST = process.env.SSHMCP_TARGET_HOST || "sshmcp-core";
+const TARGET_PORT = parseInt(process.env.SSHMCP_TARGET_PORT || "8000", 10);
+// Upstream MCP endpoint path. mingyang91/ssh-mcp serves streamable HTTP at "/"
+// (not "/mcp"), so the proxy maps whatever path the client used to this one.
+const TARGET_PATH = process.env.SSHMCP_TARGET_PATH || "/";
+const LISTEN_PORT = parseInt(process.env.SSHMCP_LISTEN_PORT || "8822", 10);
+const ADMIN_PORT = parseInt(process.env.SSHMCP_ADMIN_PORT || "8825", 10);
+const ADMIN_PASSWORD = normalizeSecret(process.env.SSHMCP_ADMIN_PASSWORD || "");
+const ALIASES_FILE =
+  process.env.SSHMCP_ALIASES_FILE ||
+  path.join(__dirname, "data", "ssh_aliases.json");
+
+if (!API_KEY) {
+  console.error("SSHMCP_API_KEY is not set – exiting.");
+  process.exit(1);
+}
+
+// --- Alias registry (plaintext for now; upgrade path: docker secrets + key_path) ---
+let aliases = {};
+
+function loadAliases() {
+  try {
+    aliases = JSON.parse(fs.readFileSync(ALIASES_FILE, "utf8"));
+    console.log(`Loaded ${Object.keys(aliases).length} SSH aliases from ${ALIASES_FILE}`);
+  } catch (err) {
+    console.error(`Warning: cannot load aliases file ${ALIASES_FILE}: ${err.message}`);
+    aliases = {};
+  }
+}
+
+function resolveAlias(name) {
+  if (typeof name !== "string") return null;
+  return aliases[name] || null;
+}
+
+function aliasListText() {
+  const entries = Object.keys(aliases)
+    .sort()
+    .map((key) => {
+      const a = aliases[key];
+      return {
+        alias: key,
+        host: a.host,
+        port: a.port != null ? a.port : 22,
+        username: a.username,
+        usesKey: Boolean(a.key_path),
+      };
+    });
+  return JSON.stringify({ aliases: entries }, null, 2);
+}
+
+// Inject stored host/port/credentials when ssh_connect is addressed by alias.
+function applyAlias(msg) {
+  let name;
+  let args;
+  if (msg.method === "tools/call" && msg.params && msg.params.arguments) {
+    name = msg.params.name;
+    args = msg.params.arguments;
+  } else {
+    name = msg.method;
+    args = msg.params;
+  }
+  if (name !== "ssh_connect" || !args || typeof args !== "object") return;
+
+  const alias = resolveAlias(args.address);
+  if (!alias) return;
+
+  args.address = `${alias.host}:${alias.port != null ? alias.port : 22}`;
+  if (!args.username) args.username = alias.username;
+  if (!args.password && !args.key_path) {
+    if (alias.key_path) args.key_path = alias.key_path;
+    else if (alias.password) args.password = alias.password;
+  }
+}
+
+function aliasToolDefinition() {
+  return {
+    name: "ssh_list_aliases",
+    description:
+      "List all configured SSH aliases (alias, host, port, username). Never includes passwords or keys.",
+    inputSchema: { type: "object", properties: {} },
+  };
+}
+
+function isAliasListRequest(msg) {
+  return (
+    msg &&
+    (msg.method === "ssh_list_aliases" ||
+      (msg.method === "tools/call" &&
+        msg.params &&
+        msg.params.name === "ssh_list_aliases"))
+  );
+}
+
+function respondDirect(msg, res) {
+  const payload = {
+    jsonrpc: "2.0",
+    id: msg.id !== undefined ? msg.id : null,
+    result: {
+      content: [{ type: "text", text: aliasListText() }],
+      isError: false,
+    },
+  };
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    "Content-Length": body.length,
+  });
+  res.end(body);
+}
+
+// Append ssh_list_aliases to a tools/list response if it is missing.
+function patchToolsList(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    const messages = Array.isArray(parsed) ? parsed : [parsed];
+    for (const m of messages) {
+      const tools = m && m.result && Array.isArray(m.result.tools) ? m.result.tools : null;
+      if (tools && !tools.some((t) => t && t.name === "ssh_list_aliases")) {
+        tools.push(aliasToolDefinition());
+      }
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    return raw;
+  }
+}
+
+function forward(req, res, modifiedBody, onResponse) {
+  const headers = { ...req.headers };
+  delete headers["content-length"];
+
+  // Map the client's URL onto the upstream endpoint: host is fixed, but the
+  // path is the upstream TARGET_PATH so clients can use /mcp while the core
+  // serves "/". Query string (if any) is preserved.
+  const u = new URL(req.url, "http://mcp.local");
+  const upstreamPath = TARGET_PATH + (u.search || "");
+
+  const proxyReq = http.request(
+    {
+      hostname: TARGET_HOST,
+      port: TARGET_PORT,
+      path: upstreamPath,
+      method: req.method,
+      headers,
+    },
+    (proxyRes) => {
+      if (onResponse) {
+        const chunks = [];
+        proxyRes.on("data", (c) => chunks.push(c));
+        proxyRes.on("end", () => {
+          const patched = onResponse(Buffer.concat(chunks).toString("utf8"));
+                  // The patched body differs in length from the upstream response, so
+                  // the original Content-Length would silently truncate it (or abort
+                  // the connection) and clients would fail with JSON parse errors.
+                  // Recompute it for the modified payload.
+                  res.writeHead(proxyRes.statusCode || 500, {
+                    ...proxyRes.headers,
+                    "content-length": Buffer.byteLength(patched),
+                  });
+                  res.end(patched);
+                });
+      } else {
+        res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+        proxyRes.pipe(res, { end: true });
+      }
+    }
+  );
+
+  proxyReq.on("error", (err) => {
+    console.error("Error in proxy request:", err);
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("Bad Gateway");
+  });
+
+  if (modifiedBody === undefined) {
+    req.pipe(proxyReq, { end: true });
+  } else {
+    proxyReq.end(modifiedBody);
+  }
+}
+
+loadAliases();
+
+function isAuthorized(authHeader) {
+  const raw = String(authHeader || "").trim();
+  // scheme is case-insensitive per RFC 7235; be tolerant of stray whitespace
+  return /^bearer\s+/i.test(raw) && raw.replace(/^bearer\s+/i, "").trim() === API_KEY;
+}
+
+const server = http.createServer((req, res) => {
+  // Respond to OPTIONS requests directly to prevent them from hitting the
+  // upstream MCP server (which may not support them or crash on non-post paths).
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    });
+    res.end();
+    return;
+  }
+
+  if (!isAuthorized(req.headers["authorization"])) {
+    res.writeHead(401, { "Content-Type": "text/plain" });
+    res.end("Unauthorized");
+    return;
+  }
+
+  if (req.method !== "POST") {
+    forward(req, res);
+    return;
+  }
+
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => {
+    const rawBody = Buffer.concat(chunks).toString("utf8");
+    let jsonBody = null;
+    try {
+      jsonBody = JSON.parse(rawBody);
+    } catch {
+      // Not JSON (SSE etc.) – forward untouched.
+    }
+
+    if (!jsonBody) {
+      req.body = rawBody; // no-op placeholder; forward below uses original stream
+      forward(req, res);
+      return;
+    }
+
+    const messages = Array.isArray(jsonBody) ? jsonBody : [jsonBody];
+    let interceptResponse = false;
+    for (const m of messages) {
+      if (!m || typeof m !== "object") continue;
+      if (isAliasListRequest(m)) {
+        respondDirect(m, res);
+        return;
+      }
+      if (m.method === "tools/list") {
+        interceptResponse = true;
+      }
+      applyAlias(m);
+    }
+
+    const newBody = Buffer.from(JSON.stringify(jsonBody), "utf8");
+    forward(req, res, newBody, interceptResponse ? patchToolsList : undefined);
+  });
+});
+
+// Auth check is per-request; aliases are loaded from file fresh on each read.
+// The admin server mutates the file and calls onReload (loadAliases) to keep
+// the in-memory registry in sync.
+
+server.listen(LISTEN_PORT, () => {
+  console.log(
+    `Auth proxy listening on port ${LISTEN_PORT}, forwarding to ${TARGET_HOST}:${TARGET_PORT}`
+  );
+});
+
+// Admin server (UI + REST API for the alias registry) on its own port.
+// Disabled when SSHMCP_ADMIN_PASSWORD is empty.
+const { startAdminServer } = require("./admin-server.js");
+startAdminServer({
+  port: ADMIN_PORT,
+  password: ADMIN_PASSWORD,
+  aliasesFile: ALIASES_FILE,
+  onReload: loadAliases, // reload aliases after every admin change so the proxy uses them immediately
+});
