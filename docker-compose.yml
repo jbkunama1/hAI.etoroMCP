@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - portainer_data:/data
+
+  etoro-mcp:
+    # Pinned to the image published by the docker-image.yml workflow.
+    # Override with ETOROMCP_IMAGE=... if you need a different tag.
+    image: ${ETOROMCP_IMAGE:-ghcr.io/jbkunama1/hai.etoromcp:main}
+    container_name: etoro-mcp
+    env_file:
+      - .env
+    depends_on:
+      - portainer
+    ports:
+      - "${ETOROMCP_PORT:-8080}:${ETOROMCP_PORT:-8080}"
+      - "${SSHMCP_API_PORT:-8822}:${SSHMCP_API_PORT:-8822}"   # SSH-MCP-Auth proxy
+    restart: unless-stopped
+
+volumes:
+  portainer_data:
